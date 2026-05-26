@@ -14,9 +14,12 @@ limitations under the License.
 package signals
 
 import (
+	"errors"
 	"fmt"
 	"net"
+	"os/user"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Microsoft/go-winio"
@@ -30,13 +33,52 @@ func ReloadPipeName(pid int) string {
 }
 
 // listenPipe creates a Windows named pipe listener at the given path.
-// The pipe is secured so that the creating user (Creator Owner),
-// Built-in Administrators, and Local System have full access.
+// The pipe is secured so that the current user, Built-in Administrators,
+// and Local System have full access.
+//
+// This now uses the user's actual SID rather than a Creator Owner (CO) SID.
 func listenPipe(name string) (net.Listener, error) {
+	sd, err := buildPipeSecurityDescriptor()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build pipe security descriptor: %w", err)
+	}
 	return winio.ListenPipe(name, &winio.PipeConfig{
-		// CO = Creator Owner, BA = Built-in Administrators, SY = Local System.
-		SecurityDescriptor: "D:P(A;;GA;;;CO)(A;;GA;;;BA)(A;;GA;;;SY)",
+		SecurityDescriptor: sd,
 	})
+}
+
+// buildPipeSecurityDescriptor constructs an SDDL string granting full access to
+// the current user, Built-in Administrators, and Local System.
+// Note: inheritance is disabled.
+func buildPipeSecurityDescriptor() (string, error) {
+	u, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("failed to look up current user: %w", err)
+	}
+	if err := validateWindowsSID(u.Uid); err != nil {
+		return "", fmt.Errorf("invalid current user SID %q: %w", u.Uid, err)
+	}
+	// Current User / Administrators / Local System
+	return fmt.Sprintf("D:P(A;;GA;;;%s)(A;;GA;;;BA)(A;;GA;;;SY)", u.Uid), nil
+}
+
+// validateWindowsSID returns a non-nil error if s is not a syntactically valid
+func validateWindowsSID(s string) error {
+	if s == "" {
+		return errors.New("empty SID")
+	}
+	if !strings.HasPrefix(s, "S-1-") {
+		return errors.New("not a Windows SID")
+	}
+	for _, part := range strings.Split(s[2:], "-") {
+		if part == "" {
+			return errors.New("malformed SID")
+		}
+		if _, err := strconv.ParseUint(part, 10, 64); err != nil {
+			return fmt.Errorf("malformed SID component %q", part)
+		}
+	}
+	return nil
 }
 
 // SignalReload connects to the reload named pipe for the given PID, triggering
