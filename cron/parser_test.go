@@ -143,6 +143,11 @@ func TestParseScheduleErrors(t *testing.T) {
 		{"@unrecognized", "unrecognized descriptor"},
 		{"* * * *", "expected 5 to 6 fields"},
 		{"", "empty spec string"},
+		{"TZ=UTC", "not followed by a schedule"},
+		{"CRON_TZ=Asia/Tokyo", "not followed by a schedule"},
+		{"TZ=", "not followed by a schedule"},
+		{"CRON_TZ=Europe/Rome @every 1h", "not supported for @every"},
+		{"TZ=Asia/Tokyo @every 30m", "not supported for @every"},
 	}
 	for _, c := range tests {
 		actual, err := secondParser.Parse(c.expr)
@@ -158,6 +163,7 @@ func TestParseScheduleErrors(t *testing.T) {
 
 func TestParseSchedule(t *testing.T) {
 	tokyo, _ := time.LoadLocation("Asia/Tokyo")
+	rome, _ := time.LoadLocation("Europe/Rome")
 	entries := []struct {
 		parser   Parser
 		expr     string
@@ -168,12 +174,14 @@ func TestParseSchedule(t *testing.T) {
 		{secondParser, "CRON_TZ=UTC  0 5 * * * *", every5min(time.UTC)},
 		{standardParser, "CRON_TZ=UTC  5 * * * *", every5min(time.UTC)},
 		{secondParser, "CRON_TZ=Asia/Tokyo 0 5 * * * *", every5min(tokyo)},
+		{secondParser, "CRON_TZ=Asia/Tokyo\t0 5 * * * *", every5min(tokyo)},
 		{secondParser, "@every 5m", ConstantDelaySchedule{5 * time.Minute}},
 		{secondParser, "@every 5ms", ConstantDelaySchedule{5 * time.Millisecond}},
 		{secondParser, "@every 5ns", ConstantDelaySchedule{5 * time.Nanosecond}},
 		{secondParser, "@midnight", midnight(time.Local)}, //nolint:gosmopolitan
 		{secondParser, "TZ=UTC  @midnight", midnight(time.UTC)},
 		{secondParser, "TZ=Asia/Tokyo @midnight", midnight(tokyo)},
+		{secondParser, "CRON_TZ=Europe/Rome @daily", midnight(rome)},
 		{secondParser, "@yearly", annual(time.Local)},   //nolint:gosmopolitan
 		{secondParser, "@annually", annual(time.Local)}, //nolint:gosmopolitan
 		{
@@ -407,5 +415,53 @@ func annual(loc *time.Location) *SpecSchedule {
 		Month:    1 << months.min,
 		Dow:      all(dow),
 		Location: loc,
+	}
+}
+
+// A timezone-prefixed schedule holds its local wall clock across a DST
+// transition, shifting the underlying UTC instant by itself.
+func TestParseScheduleTimezoneDST(t *testing.T) {
+	rome, err := time.LoadLocation("Europe/Rome")
+	if err != nil {
+		t.Fatalf("loading Europe/Rome: %v", err)
+	}
+
+	sched, err := secondParser.Parse("CRON_TZ=Europe/Rome 0 0 9 * * *")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Europe/Rome leaves DST on 2026-10-25.
+	next := time.Date(2026, 10, 23, 12, 0, 0, 0, rome)
+	for _, exp := range []struct{ local, utc string }{
+		{"2026-10-24T09:00:00+02:00", "2026-10-24T07:00:00Z"},
+		{"2026-10-25T09:00:00+01:00", "2026-10-25T08:00:00Z"},
+		{"2026-10-26T09:00:00+01:00", "2026-10-26T08:00:00Z"},
+	} {
+		next = sched.Next(next)
+		if got := next.In(rome).Format(time.RFC3339); got != exp.local {
+			t.Errorf("local => expected %s, got %s", exp.local, got)
+		}
+
+		if got := next.UTC().Format(time.RFC3339); got != exp.utc {
+			t.Errorf("utc => expected %s, got %s", exp.utc, got)
+		}
+	}
+}
+
+// A constant delay has no wall clock for a timezone to apply to, so the pair is
+// rejected rather than silently dropping the location.
+func TestParseScheduleTimezoneRejectedForEvery(t *testing.T) {
+	_, err := secondParser.Parse("CRON_TZ=Europe/Rome @every 1h")
+	if err == nil {
+		t.Error("expected an error, got nil")
+	} else if !strings.Contains(err.Error(), "CRON_TZ=Europe/Rome @every 1h") {
+		t.Errorf("error should include the original spec, got: %v", err)
+	}
+
+	// An unprefixed @every is still valid.
+	_, err = secondParser.Parse("@every 1h")
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
