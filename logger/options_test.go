@@ -155,20 +155,24 @@ func TestApplyOptionsToLoggersFileOutput(t *testing.T) {
 }
 
 func TestLogFileTee(t *testing.T) {
+	// t.TempDir() must be called before the cleanup below is registered.
+	// Cleanups run LIFO, so registering TempDir's RemoveAll first makes it run
+	// last — after the cleanup that closes the log file. The reverse order
+	// fails on Windows, which cannot delete a file that is still open.
+	logPath := filepath.Join(t.TempDir(), "dapr.log")
+
 	var console bytes.Buffer
 
 	consoleWriter = &console
 
 	t.Cleanup(func() {
 		consoleWriter = os.Stdout
-		// Re-point all registered loggers back at the real stdout. Doing this
-		// before restoring consoleWriter would leave them aimed at the dead
-		// test buffer.
+		// Re-point all registered loggers back at the real stdout, which also
+		// closes the log file. Doing this before restoring consoleWriter would
+		// leave them aimed at the dead test buffer.
 		o := DefaultOptions()
 		require.NoError(t, ApplyOptionsToLoggers(&o))
 	})
-
-	logPath := filepath.Join(t.TempDir(), "dapr.log")
 
 	o := DefaultOptions()
 	o.OutputFile = logPath
@@ -188,6 +192,9 @@ func TestLogFileTee(t *testing.T) {
 }
 
 func TestLogFileTeeDisabledKeepsFileOnly(t *testing.T) {
+	// TempDir before Cleanup — see the ordering note in TestLogFileTee.
+	logPath := filepath.Join(t.TempDir(), "dapr.log")
+
 	var console bytes.Buffer
 
 	consoleWriter = &console
@@ -197,8 +204,6 @@ func TestLogFileTeeDisabledKeepsFileOnly(t *testing.T) {
 		o := DefaultOptions()
 		require.NoError(t, ApplyOptionsToLoggers(&o))
 	})
-
-	logPath := filepath.Join(t.TempDir(), "dapr.log")
 
 	o := DefaultOptions()
 	o.OutputFile = logPath
