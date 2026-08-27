@@ -17,22 +17,26 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"sync"
 	"time"
+
+	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
 
 const (
-	defaultJSONOutput      = false
-	defaultOutputLevel     = "info"
-	defaultTimestampFormat = time.RFC3339Nano
-	defaultOutputFileTee   = false
-	undefinedAppID         = ""
+	defaultJSONOutput         = false
+	defaultOutputLevel        = "info"
+	defaultTimestampFormat    = time.RFC3339Nano
+	defaultOutputFileTee      = false
+	defaultOutputFileCompress = false
+	undefinedAppID            = ""
 )
 
 var (
-	// logOutputMu protects logOutputFile from concurrent access.
-	logOutputMu   sync.Mutex
-	logOutputFile *os.File
+	// logOutputMu protects logOutputCloser from concurrent access.
+	logOutputMu     sync.Mutex
+	logOutputCloser io.Closer
 
 	// consoleWriter is the console log destination. It is a variable rather
 	// than a direct os.Stdout reference so that tests can capture console
@@ -63,6 +67,21 @@ type Options struct {
 	// file and the console instead of the file only. It has no effect when
 	// OutputFile is unset.
 	OutputFileTee bool
+
+	// OutputFileMaxSize is the maximum size in megabytes of the log file
+	// before it gets rotated. Empty or "0" disables size-based rotation.
+	OutputFileMaxSize string
+
+	// OutputFileMaxBackups is the maximum number of rotated log files to keep.
+	// Empty or "0" keeps all files, subject to OutputFileMaxAge.
+	OutputFileMaxBackups string
+
+	// OutputFileMaxAge is the maximum number of days to retain rotated log
+	// files. Empty or "0" disables age-based deletion.
+	OutputFileMaxAge string
+
+	// OutputFileCompress, when true, gzip-compresses rotated log files.
+	OutputFileCompress bool
 }
 
 // SetOutputLevel sets the log output level.
@@ -102,6 +121,21 @@ func (o *Options) AttachCmdFlags(
 			"log-timestamp-format",
 			"",
 			"Format for log timestamps, expressed as a Go time layout, e.g. '2006/01/02 15:04:05.000' (default RFC3339 with nanoseconds)")
+		stringVar(
+			&o.OutputFileMaxSize,
+			"log-file-max-size",
+			"",
+			"Maximum size in megabytes of the log file before it gets rotated. 0 disables size-based rotation. No effect without --log-file")
+		stringVar(
+			&o.OutputFileMaxBackups,
+			"log-file-max-backups",
+			"",
+			"Maximum number of rotated log files to keep. 0 keeps all files. No effect without --log-file")
+		stringVar(
+			&o.OutputFileMaxAge,
+			"log-file-max-age",
+			"",
+			"Maximum number of days to retain rotated log files. 0 disables age-based deletion. No effect without --log-file")
 	}
 
 	if boolVar != nil {
@@ -115,18 +149,24 @@ func (o *Options) AttachCmdFlags(
 			"log-file-tee",
 			defaultOutputFileTee,
 			"When --log-file is set, also keep writing logs to the console. No effect without --log-file (default false)")
+		boolVar(
+			&o.OutputFileCompress,
+			"log-file-compress",
+			defaultOutputFileCompress,
+			"Gzip-compress rotated log files. No effect without --log-file (default false)")
 	}
 }
 
 // DefaultOptions returns default values of Options.
 func DefaultOptions() Options {
 	return Options{
-		JSONFormatEnabled: defaultJSONOutput,
-		appID:             undefinedAppID,
-		OutputLevel:       defaultOutputLevel,
-		OutputFile:        "",
-		TimestampFormat:   "",
-		OutputFileTee:     defaultOutputFileTee,
+		JSONFormatEnabled:  defaultJSONOutput,
+		appID:              undefinedAppID,
+		OutputLevel:        defaultOutputLevel,
+		OutputFile:         "",
+		TimestampFormat:    "",
+		OutputFileTee:      defaultOutputFileTee,
+		OutputFileCompress: defaultOutputFileCompress,
 	}
 }
 
@@ -177,25 +217,24 @@ func setLogOutput(options *Options, loggers map[string]Logger) error {
 	defer logOutputMu.Unlock()
 
 	var (
-		out     io.Writer = consoleWriter
-		newFile *os.File
+		out       = consoleWriter
+		newCloser io.Closer
 	)
 
 	if options.OutputFile != "" {
-		var err error
-
-		newFile, err = os.OpenFile(options.OutputFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		fileOut, closer, err := newFileWriter(options)
 		if err != nil {
-			return fmt.Errorf("failed to open log file %q: %w", options.OutputFile, err)
+			return err
 		}
 
-		out = newFile
+		newCloser = closer
+		out = fileOut
 
 		if options.OutputFileTee {
 			// Console first: io.MultiWriter stops at the first failed writer,
 			// so this ordering keeps console output alive even when file
 			// writes start failing (e.g. disk full).
-			out = io.MultiWriter(consoleWriter, newFile)
+			out = io.MultiWriter(consoleWriter, fileOut)
 		}
 	}
 
@@ -205,11 +244,66 @@ func setLogOutput(options *Options, loggers map[string]Logger) error {
 	}
 
 	// Close the previous log file after loggers have been redirected.
-	if logOutputFile != nil {
-		logOutputFile.Close()
+	if logOutputCloser != nil {
+		logOutputCloser.Close()
 	}
 
-	logOutputFile = newFile
+	logOutputCloser = newCloser
 
 	return nil
+}
+
+// newFileWriter returns the file-backed writer for the options: a plain
+// append-mode file when no rotation option is set, or a rotating (lumberjack)
+// writer when any rotation option is enabled. The returned io.Closer releases
+// the underlying file.
+func newFileWriter(options *Options) (io.Writer, io.Closer, error) {
+	maxSize, err := parseRotationValue("log-file-max-size", options.OutputFileMaxSize)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	maxBackups, err := parseRotationValue("log-file-max-backups", options.OutputFileMaxBackups)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	maxAge, err := parseRotationValue("log-file-max-age", options.OutputFileMaxAge)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if maxSize == 0 && maxBackups == 0 && maxAge == 0 && !options.OutputFileCompress {
+		f, ferr := os.OpenFile(options.OutputFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if ferr != nil {
+			return nil, nil, fmt.Errorf("failed to open log file %q: %w", options.OutputFile, ferr)
+		}
+
+		return f, f, nil
+	}
+
+	lj := &lumberjack.Logger{
+		Filename:   options.OutputFile,
+		MaxSize:    maxSize,    // megabytes; lumberjack defaults to 100 when 0
+		MaxBackups: maxBackups, // number of rotated files retained
+		MaxAge:     maxAge,     // days
+		Compress:   options.OutputFileCompress,
+	}
+
+	return lj, lj, nil
+}
+
+// parseRotationValue parses a rotation flag value as a non-negative integer.
+// An empty value means 0, which disables the corresponding limit.
+func parseRotationValue(name, value string) (int, error) {
+	if value == "" {
+		return 0, nil
+	}
+
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid value for --%s: %q (must be a non-negative integer)", name, value)
+	}
+
+	return n, nil
 }

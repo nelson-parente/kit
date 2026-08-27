@@ -21,6 +21,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
 
 func TestOptions(t *testing.T) {
@@ -157,6 +158,7 @@ func TestLogFileTee(t *testing.T) {
 	var console bytes.Buffer
 
 	consoleWriter = &console
+
 	t.Cleanup(func() {
 		consoleWriter = os.Stdout
 		// Re-point all registered loggers back at the real stdout. Doing this
@@ -173,6 +175,7 @@ func TestLogFileTee(t *testing.T) {
 	o.OutputFileTee = true
 
 	l := NewLogger("testLoggerTee")
+
 	require.NoError(t, ApplyOptionsToLoggers(&o))
 
 	msg := "hello-tee"
@@ -188,6 +191,7 @@ func TestLogFileTeeDisabledKeepsFileOnly(t *testing.T) {
 	var console bytes.Buffer
 
 	consoleWriter = &console
+
 	t.Cleanup(func() {
 		consoleWriter = os.Stdout
 		o := DefaultOptions()
@@ -202,6 +206,7 @@ func TestLogFileTeeDisabledKeepsFileOnly(t *testing.T) {
 	// behaviour and must not change.
 
 	l := NewLogger("testLoggerTeeDisabled")
+
 	require.NoError(t, ApplyOptionsToLoggers(&o))
 
 	msg := "file-only"
@@ -211,6 +216,122 @@ func TestLogFileTeeDisabledKeepsFileOnly(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(b), msg)
 	assert.NotContains(t, console.String(), msg, "console must stay silent when tee is off")
+}
+
+func TestNewFileWriter(t *testing.T) {
+	t.Run("rotation options build a rotating writer", func(t *testing.T) {
+		o := DefaultOptions()
+		o.OutputFile = filepath.Join(t.TempDir(), "dapr.log")
+		o.OutputFileMaxSize = "1"
+		o.OutputFileMaxBackups = "3"
+		o.OutputFileMaxAge = "7"
+		o.OutputFileCompress = true
+
+		w, c, err := newFileWriter(&o)
+		require.NoError(t, err)
+
+		lj, ok := w.(*lumberjack.Logger)
+		require.True(t, ok, "expected a lumberjack writer")
+		assert.Equal(t, o.OutputFile, lj.Filename)
+		assert.Equal(t, 1, lj.MaxSize)
+		assert.Equal(t, 3, lj.MaxBackups)
+		assert.Equal(t, 7, lj.MaxAge)
+		assert.True(t, lj.Compress)
+
+		require.NoError(t, c.Close())
+	})
+
+	t.Run("no rotation options keeps a plain append file", func(t *testing.T) {
+		o := DefaultOptions()
+		o.OutputFile = filepath.Join(t.TempDir(), "dapr.log")
+
+		w, c, err := newFileWriter(&o)
+		require.NoError(t, err)
+
+		_, ok := w.(*os.File)
+		assert.True(t, ok, "expected a plain *os.File when no rotation option is set")
+
+		require.NoError(t, c.Close())
+	})
+
+	t.Run("compress alone is enough to enable rotation", func(t *testing.T) {
+		o := DefaultOptions()
+		o.OutputFile = filepath.Join(t.TempDir(), "dapr.log")
+		o.OutputFileCompress = true
+
+		w, c, err := newFileWriter(&o)
+		require.NoError(t, err)
+
+		_, ok := w.(*lumberjack.Logger)
+		assert.True(t, ok)
+
+		require.NoError(t, c.Close())
+	})
+
+	t.Run("invalid rotation value errors", func(t *testing.T) {
+		for _, tc := range []struct {
+			name  string
+			apply func(o *Options)
+		}{
+			{"max-size not a number", func(o *Options) { o.OutputFileMaxSize = "not-a-number" }},
+			{"max-backups negative", func(o *Options) { o.OutputFileMaxBackups = "-1" }},
+			{"max-age not a number", func(o *Options) { o.OutputFileMaxAge = "7d" }},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				o := DefaultOptions()
+				o.OutputFile = filepath.Join(t.TempDir(), "dapr.log")
+				tc.apply(&o)
+
+				_, _, err := newFileWriter(&o)
+				require.Error(t, err)
+			})
+		}
+	})
+}
+
+func TestParseRotationValue(t *testing.T) {
+	t.Run("empty means disabled", func(t *testing.T) {
+		got, err := parseRotationValue("log-file-max-size", "")
+		require.NoError(t, err)
+		assert.Equal(t, 0, got)
+	})
+
+	t.Run("parses a non-negative integer", func(t *testing.T) {
+		got, err := parseRotationValue("log-file-max-size", "42")
+		require.NoError(t, err)
+		assert.Equal(t, 42, got)
+	})
+
+	t.Run("rejects negatives and non-numbers", func(t *testing.T) {
+		for _, v := range []string{"-1", "abc", "1.5", " 1"} {
+			_, err := parseRotationValue("log-file-max-size", v)
+			require.Error(t, err, "value %q should be rejected", v)
+		}
+	})
+}
+
+func TestApplyOptionsToLoggersRotation(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "dapr.log")
+
+	o := DefaultOptions()
+	o.OutputFile = logPath
+	o.OutputFileMaxSize = "1"
+
+	l := NewLogger("testLoggerRotation")
+
+	require.NoError(t, ApplyOptionsToLoggers(&o))
+
+	t.Cleanup(func() {
+		d := DefaultOptions()
+		require.NoError(t, ApplyOptionsToLoggers(&d))
+	})
+
+	msg := "rotating-message"
+	l.Info(msg)
+
+	b, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), msg)
 }
 
 func TestApplyOptionsToLoggersFileOutputReapply(t *testing.T) {
