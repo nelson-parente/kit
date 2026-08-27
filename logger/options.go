@@ -25,6 +25,7 @@ const (
 	defaultJSONOutput      = false
 	defaultOutputLevel     = "info"
 	defaultTimestampFormat = time.RFC3339Nano
+	defaultOutputFileTee   = false
 	undefinedAppID         = ""
 )
 
@@ -32,6 +33,11 @@ var (
 	// logOutputMu protects logOutputFile from concurrent access.
 	logOutputMu   sync.Mutex
 	logOutputFile *os.File
+
+	// consoleWriter is the console log destination. It is a variable rather
+	// than a direct os.Stdout reference so that tests can capture console
+	// output.
+	consoleWriter io.Writer = os.Stdout
 )
 
 // Options defines the sets of options for Dapr logging.
@@ -52,6 +58,11 @@ type Options struct {
 	// Go time layout. An empty value means the default (RFC3339 with
 	// nanoseconds).
 	TimestampFormat string
+
+	// OutputFileTee, when true and OutputFile is set, writes logs to both the
+	// file and the console instead of the file only. It has no effect when
+	// OutputFile is unset.
+	OutputFileTee bool
 }
 
 // SetOutputLevel sets the log output level.
@@ -99,6 +110,11 @@ func (o *Options) AttachCmdFlags(
 			"log-as-json",
 			defaultJSONOutput,
 			"print log as JSON (default false)")
+		boolVar(
+			&o.OutputFileTee,
+			"log-file-tee",
+			defaultOutputFileTee,
+			"When --log-file is set, also keep writing logs to the console. No effect without --log-file (default false)")
 	}
 }
 
@@ -110,6 +126,7 @@ func DefaultOptions() Options {
 		OutputLevel:       defaultOutputLevel,
 		OutputFile:        "",
 		TimestampFormat:   "",
+		OutputFileTee:     defaultOutputFileTee,
 	}
 }
 
@@ -142,7 +159,7 @@ func ApplyOptionsToLoggers(options *Options) error {
 		v.SetOutputLevel(daprLogLevel)
 	}
 
-	err := setLogOutput(options.OutputFile, internalLoggers)
+	err := setLogOutput(options, internalLoggers)
 	if err != nil {
 		return err
 	}
@@ -150,28 +167,36 @@ func ApplyOptionsToLoggers(options *Options) error {
 	return nil
 }
 
-// setLogOutput configures log output destination. If path is non-empty, logs
-// are written to the file at that path. If empty, output reverts to stdout.
-// The new file is opened before closing the previous one so that loggers are
-// never left pointing at a closed file descriptor.
-func setLogOutput(path string, loggers map[string]Logger) error {
+// setLogOutput configures log output destination. If options.OutputFile is
+// non-empty, logs are written to the file at that path, and additionally to the
+// console when options.OutputFileTee is set. If empty, output reverts to the
+// console. The new file is opened before closing the previous one so that
+// loggers are never left pointing at a closed file descriptor.
+func setLogOutput(options *Options, loggers map[string]Logger) error {
 	logOutputMu.Lock()
 	defer logOutputMu.Unlock()
 
 	var (
-		out     io.Writer = os.Stdout
+		out     io.Writer = consoleWriter
 		newFile *os.File
 	)
 
-	if path != "" {
+	if options.OutputFile != "" {
 		var err error
 
-		newFile, err = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		newFile, err = os.OpenFile(options.OutputFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
-			return fmt.Errorf("failed to open log file %q: %w", path, err)
+			return fmt.Errorf("failed to open log file %q: %w", options.OutputFile, err)
 		}
 
 		out = newFile
+
+		if options.OutputFileTee {
+			// Console first: io.MultiWriter stops at the first failed writer,
+			// so this ordering keeps console output alive even when file
+			// writes start failing (e.g. disk full).
+			out = io.MultiWriter(consoleWriter, newFile)
+		}
 	}
 
 	// Switch all loggers to the new output before closing the old file.

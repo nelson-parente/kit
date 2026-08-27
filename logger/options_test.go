@@ -14,6 +14,7 @@ limitations under the License.
 package logger
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,6 +30,7 @@ func TestOptions(t *testing.T) {
 		assert.Equal(t, undefinedAppID, o.appID)
 		assert.Equal(t, defaultOutputLevel, o.OutputLevel)
 		assert.Empty(t, o.OutputFile)
+		assert.Equal(t, defaultOutputFileTee, o.OutputFileTee)
 	})
 
 	t.Run("set dapr ID", func(t *testing.T) {
@@ -60,9 +62,14 @@ func TestOptions(t *testing.T) {
 		}
 
 		logAsJSONAsserted := false
+		logFileTeeAsserted := false
 		testBoolVarFn := func(p *bool, name string, value bool, usage string) {
 			if name == "log-as-json" && value == defaultJSONOutput {
 				logAsJSONAsserted = true
+			}
+
+			if name == "log-file-tee" && value == defaultOutputFileTee {
+				logFileTeeAsserted = true
 			}
 		}
 
@@ -73,6 +80,7 @@ func TestOptions(t *testing.T) {
 		assert.True(t, logFileAsserted)
 		assert.True(t, logTimestampFormatAsserted)
 		assert.True(t, logAsJSONAsserted)
+		assert.True(t, logFileTeeAsserted)
 	})
 }
 
@@ -143,6 +151,66 @@ func TestApplyOptionsToLoggersFileOutput(t *testing.T) {
 	b, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	assert.Contains(t, string(b), msg)
+}
+
+func TestLogFileTee(t *testing.T) {
+	var console bytes.Buffer
+
+	consoleWriter = &console
+	t.Cleanup(func() {
+		consoleWriter = os.Stdout
+		// Re-point all registered loggers back at the real stdout. Doing this
+		// before restoring consoleWriter would leave them aimed at the dead
+		// test buffer.
+		o := DefaultOptions()
+		require.NoError(t, ApplyOptionsToLoggers(&o))
+	})
+
+	logPath := filepath.Join(t.TempDir(), "dapr.log")
+
+	o := DefaultOptions()
+	o.OutputFile = logPath
+	o.OutputFileTee = true
+
+	l := NewLogger("testLoggerTee")
+	require.NoError(t, ApplyOptionsToLoggers(&o))
+
+	msg := "hello-tee"
+	l.Info(msg)
+
+	b, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), msg, "message should reach the file")
+	assert.Contains(t, console.String(), msg, "message should also reach the console")
+}
+
+func TestLogFileTeeDisabledKeepsFileOnly(t *testing.T) {
+	var console bytes.Buffer
+
+	consoleWriter = &console
+	t.Cleanup(func() {
+		consoleWriter = os.Stdout
+		o := DefaultOptions()
+		require.NoError(t, ApplyOptionsToLoggers(&o))
+	})
+
+	logPath := filepath.Join(t.TempDir(), "dapr.log")
+
+	o := DefaultOptions()
+	o.OutputFile = logPath
+	// OutputFileTee deliberately left false — this is the pre-existing
+	// behaviour and must not change.
+
+	l := NewLogger("testLoggerTeeDisabled")
+	require.NoError(t, ApplyOptionsToLoggers(&o))
+
+	msg := "file-only"
+	l.Info(msg)
+
+	b, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), msg)
+	assert.NotContains(t, console.String(), msg, "console must stay silent when tee is off")
 }
 
 func TestApplyOptionsToLoggersFileOutputReapply(t *testing.T) {
