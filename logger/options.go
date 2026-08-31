@@ -172,6 +172,12 @@ func DefaultOptions() Options {
 
 // ApplyOptionsToLoggers applys options to all registered loggers.
 func ApplyOptionsToLoggers(options *Options) error {
+	// optionsLogger reports misconfigurations detected while applying options.
+	// It is fetched (or created) before the registry snapshot below so that it
+	// is always part of this apply and therefore follows the configured
+	// format, level and output like every other logger.
+	optionsLogger := NewLogger("dapr.kit.logger")
+
 	internalLoggers := getLoggers()
 
 	// Apply formatting options first
@@ -202,6 +208,17 @@ func ApplyOptionsToLoggers(options *Options) error {
 	err := setLogOutput(options, internalLoggers)
 	if err != nil {
 		return err
+	}
+
+	if options.OutputFile == "" && (options.OutputFileTee ||
+		options.OutputFileCompress ||
+		options.OutputFileMaxSize != "" ||
+		options.OutputFileMaxBackups != "" ||
+		options.OutputFileMaxAge != "") {
+		// Warn rather than fail: these options are inert without OutputFile,
+		// and an error here would turn a harmless misconfiguration into a
+		// startup failure for every binary that attaches these flags.
+		optionsLogger.Warn("--log-file-tee, --log-file-max-size, --log-file-max-backups, --log-file-max-age and --log-file-compress have no effect because --log-file is not set")
 	}
 
 	return nil
@@ -281,6 +298,18 @@ func newFileWriter(options *Options) (io.Writer, io.Closer, error) {
 
 		return f, f, nil
 	}
+
+	// Pre-create the file with the same permissions as the non-rotating path.
+	// lumberjack creates missing files as 0600 and preserves the mode of
+	// existing ones, so without this, enabling rotation would silently change
+	// new log files from 0644 to 0600 — breaking log shippers that tail the
+	// file from another container as a non-owner user.
+	f, ferr := os.OpenFile(options.OutputFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if ferr != nil {
+		return nil, nil, fmt.Errorf("failed to open log file %q: %w", options.OutputFile, ferr)
+	}
+
+	f.Close()
 
 	lj := &lumberjack.Logger{
 		Filename:   options.OutputFile,

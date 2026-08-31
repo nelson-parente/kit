@@ -370,6 +370,80 @@ func TestApplyOptionsToLoggersRotation(t *testing.T) {
 	assert.Contains(t, string(b), msg)
 }
 
+func TestInertFileOptionsWarn(t *testing.T) {
+	// TempDir before Cleanup — see the ordering note in TestLogFileTee.
+	logPath := filepath.Join(t.TempDir(), "dapr.log")
+
+	var console bytes.Buffer
+
+	consoleWriter = &console
+
+	t.Cleanup(func() {
+		consoleWriter = os.Stdout
+		o := DefaultOptions()
+		require.NoError(t, ApplyOptionsToLoggers(&o))
+	})
+
+	const warning = "have no effect because --log-file is not set"
+
+	// Tee (or any rotation option) without --log-file warns on the console.
+	o := DefaultOptions()
+	o.OutputFileTee = true
+	require.NoError(t, ApplyOptionsToLoggers(&o))
+	assert.Contains(t, console.String(), warning)
+
+	// A default configuration does not warn.
+	console.Reset()
+
+	o = DefaultOptions()
+	require.NoError(t, ApplyOptionsToLoggers(&o))
+	assert.NotContains(t, console.String(), warning)
+
+	// The same options with --log-file set are effective, so no warning.
+	console.Reset()
+
+	o = DefaultOptions()
+	o.OutputFile = logPath
+	o.OutputFileTee = true
+	require.NoError(t, ApplyOptionsToLoggers(&o))
+	assert.NotContains(t, console.String(), warning)
+}
+
+func TestRotationKeepsFilePermissionParity(t *testing.T) {
+	dir := t.TempDir()
+
+	plainPath := filepath.Join(dir, "plain.log")
+	o := DefaultOptions()
+	o.OutputFile = plainPath
+
+	w, c, err := newFileWriter(&o)
+	require.NoError(t, err)
+	_, err = w.Write([]byte("x\n"))
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+
+	rotPath := filepath.Join(dir, "rotating.log")
+	o = DefaultOptions()
+	o.OutputFile = rotPath
+	o.OutputFileMaxSize = "1"
+
+	w, c, err = newFileWriter(&o)
+	require.NoError(t, err)
+	_, err = w.Write([]byte("x\n"))
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+
+	plainInfo, err := os.Stat(plainPath)
+	require.NoError(t, err)
+	rotInfo, err := os.Stat(rotPath)
+	require.NoError(t, err)
+
+	// Compare the two paths rather than asserting an absolute mode, so the
+	// test is immune to the process umask and to Windows permission quirks.
+	assert.Equal(t, plainInfo.Mode(), rotInfo.Mode(),
+		"enabling rotation must not change log file permissions (lumberjack alone would create 0600 where the plain path creates 0644)")
+}
+
 // TestFileRotationActuallyRotates is the behavioural counterpart to
 // TestNewFileWriter: that test only asserts the lumberjack struct is populated
 // correctly, which would still pass if the rotating writer were never actually
