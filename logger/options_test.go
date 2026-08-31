@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -63,14 +64,9 @@ func TestOptions(t *testing.T) {
 		}
 
 		logAsJSONAsserted := false
-		logFileTeeAsserted := false
 		testBoolVarFn := func(p *bool, name string, value bool, usage string) {
 			if name == "log-as-json" && value == defaultJSONOutput {
 				logAsJSONAsserted = true
-			}
-
-			if name == "log-file-tee" && value == defaultOutputFileTee {
-				logFileTeeAsserted = true
 			}
 		}
 
@@ -81,7 +77,42 @@ func TestOptions(t *testing.T) {
 		assert.True(t, logFileAsserted)
 		assert.True(t, logTimestampFormatAsserted)
 		assert.True(t, logAsJSONAsserted)
-		assert.True(t, logFileTeeAsserted)
+	})
+
+	// Flag names are load-bearing: they become D3E chart annotations, so a
+	// rename is a breaking change for users who have already set them. Assert
+	// the exact registered set rather than spot-checking individual names, so
+	// that adding, removing or renaming a flag fails here deliberately.
+	t.Run("registers the exact set of log flags", func(t *testing.T) {
+		o := DefaultOptions()
+
+		stringFlags := map[string]string{}
+		boolFlags := map[string]bool{}
+
+		o.AttachCmdFlags(
+			func(p *string, name string, value string, usage string) {
+				stringFlags[name] = value
+				assert.NotEmpty(t, usage, "flag --%s must have usage text", name)
+			},
+			func(p *bool, name string, value bool, usage string) {
+				boolFlags[name] = value
+				assert.NotEmpty(t, usage, "flag --%s must have usage text", name)
+			},
+		)
+
+		assert.Equal(t, map[string]string{
+			"log-level":            defaultOutputLevel,
+			"log-file":             "",
+			"log-file-max-size":    "",
+			"log-file-max-backups": "",
+			"log-file-max-age":     "",
+		}, stringFlags)
+
+		assert.Equal(t, map[string]bool{
+			"log-as-json":       defaultJSONOutput,
+			"log-file-tee":      defaultOutputFileTee,
+			"log-file-compress": defaultOutputFileCompress,
+		}, boolFlags)
 	})
 }
 
@@ -337,6 +368,106 @@ func TestApplyOptionsToLoggersRotation(t *testing.T) {
 	b, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	assert.Contains(t, string(b), msg)
+}
+
+// TestFileRotationActuallyRotates is the behavioural counterpart to
+// TestNewFileWriter: that test only asserts the lumberjack struct is populated
+// correctly, which would still pass if the rotating writer were never actually
+// installed as the log output, or if MaxSize were interpreted in the wrong
+// unit. This one drives real log volume through the configured logger and
+// observes the rotation on disk.
+//
+// Only size-based rotation is asserted, because lumberjack performs it
+// synchronously on the write that would exceed MaxSize. Compression and
+// MaxBackups pruning run on a background goroutine ("milling"), so asserting
+// on a .gz file appearing would be timing-dependent and flaky in CI.
+func TestFileRotationActuallyRotates(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "dapr.log")
+
+	o := DefaultOptions()
+	o.OutputFile = logPath
+	o.OutputFileMaxSize = "1" // 1 MB
+
+	l := NewLogger("testLoggerRotationBehaviour")
+
+	require.NoError(t, ApplyOptionsToLoggers(&o))
+
+	t.Cleanup(func() {
+		d := DefaultOptions()
+		require.NoError(t, ApplyOptionsToLoggers(&d))
+	})
+
+	// Write comfortably more than 1 MB. Each line carries a ~2 KB payload, so
+	// ~1500 lines is roughly 3 MB and forces at least one rotation.
+	payload := strings.Repeat("x", 2048)
+	for range 1500 {
+		l.Info(payload)
+	}
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+
+	var active, archives int
+
+	for _, e := range entries {
+		if e.Name() == "dapr.log" {
+			active++
+			continue
+		}
+		// lumberjack names archives dapr-<timestamp>.log[.gz]
+		if strings.HasPrefix(e.Name(), "dapr-") {
+			archives++
+		}
+	}
+
+	assert.Equal(t, 1, active, "the active log file should still exist")
+	assert.Positive(t, archives,
+		"expected at least one rotated archive after writing ~3MB with max-size=1MB, found none in %v", entries)
+
+	// The active file must have been truncated by the rotation, i.e. it should
+	// be well under the total volume written.
+	fi, err := os.Stat(logPath)
+	require.NoError(t, err)
+	assert.Less(t, fi.Size(), int64(2*1024*1024),
+		"active file should have been rolled, not grown past MaxSize unchecked")
+}
+
+// TestTeeWithRotation covers the combination LNRS actually configures: file
+// output that both rotates and keeps writing to the console. setLogOutput
+// wraps the rotating writer in an io.MultiWriter, and nothing else exercises
+// that composition.
+func TestTeeWithRotation(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "dapr.log")
+
+	var console bytes.Buffer
+
+	consoleWriter = &console
+
+	t.Cleanup(func() {
+		consoleWriter = os.Stdout
+		d := DefaultOptions()
+		require.NoError(t, ApplyOptionsToLoggers(&d))
+	})
+
+	o := DefaultOptions()
+	o.OutputFile = logPath
+	o.OutputFileTee = true
+	o.OutputFileMaxSize = "1"
+	o.OutputFileCompress = true
+
+	l := NewLogger("testLoggerTeeRotation")
+
+	require.NoError(t, ApplyOptionsToLoggers(&o))
+
+	msg := "tee-and-rotate"
+	l.Info(msg)
+
+	b, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), msg, "rotating writer should still receive the message")
+	assert.Contains(t, console.String(), msg, "console should still receive the message when rotation is on")
 }
 
 func TestApplyOptionsToLoggersFileOutputReapply(t *testing.T) {
