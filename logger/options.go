@@ -322,17 +322,19 @@ func newFileWriter(options *Options) (io.Writer, io.Closer, error) {
 	return lj, lj, nil
 }
 
-// parseRotationValue parses a rotation flag value as a non-negative integer.
-// An empty value means 0, which disables the corresponding limit.
+// parseRotationValue parses a rotation flag value as an unsigned integer. An
+// empty value means 0, which disables the corresponding limit. The flag is
+// string-typed only because AttachCmdFlags binds through (stringVar, boolVar);
+// the value itself is unsigned end-to-end.
 func parseRotationValue(name, value string) (int, error) {
 	if value == "" {
 		return 0, nil
 	}
 
-	n, err := strconv.Atoi(value)
-	if err != nil || n < 0 {
+	n, err := strconv.ParseUint(value, 10, 31)
+	if err != nil {
 		return 0, fmt.Errorf("invalid value for --%s: %q (must be a non-negative integer)", name, value)
 	}
 
-	return n, nil
+	return int(n), nil
 }
