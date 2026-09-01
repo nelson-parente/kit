@@ -16,7 +16,6 @@ package logger
 import (
 	"io"
 	"os"
-	"time"
 
 	"github.com/sirupsen/logrus"
 )
@@ -27,6 +26,10 @@ type daprLogger struct {
 	name string
 	// loger is the instance of logrus logger
 	logger *logrus.Entry
+	// jsonOutput indicates whether the logger emits JSON formatted logs
+	jsonOutput bool
+	// timestampFormat is the format used for log timestamps
+	timestampFormat string
 }
 
 var DaprVersion = "unknown"
@@ -41,6 +44,7 @@ func newDaprLogger(name string) *daprLogger {
 			logFieldScope: name,
 			logFieldType:  LogTypeLog,
 		}),
+		timestampFormat: defaultTimestampFormat,
 	}
 
 	dl.EnableJSONOutput(defaultJSONOutput)
@@ -50,16 +54,6 @@ func newDaprLogger(name string) *daprLogger {
 
 // EnableJSONOutput enables JSON formatted output log.
 func (l *daprLogger) EnableJSONOutput(enabled bool) {
-	var formatter logrus.Formatter
-
-	fieldMap := logrus.FieldMap{
-		// If time field name is conflicted, logrus adds "fields." prefix.
-		// So rename to unused field @time to avoid the confliction.
-		logrus.FieldKeyTime:  logFieldTimeStamp,
-		logrus.FieldKeyLevel: logFieldLevel,
-		logrus.FieldKeyMsg:   logFieldMessage,
-	}
-
 	hostname, _ := os.Hostname()
 	l.logger.Data = logrus.Fields{
 		logFieldScope:    l.logger.Data[logFieldScope],
@@ -68,19 +62,19 @@ func (l *daprLogger) EnableJSONOutput(enabled bool) {
 		logFieldDaprVer:  DaprVersion,
 	}
 
-	if enabled {
-		formatter = &logrus.JSONFormatter{ //nolint: exhaustruct
-			TimestampFormat: time.RFC3339Nano,
-			FieldMap:        fieldMap,
-		}
-	} else {
-		formatter = &logrus.TextFormatter{ //nolint: exhaustruct
-			TimestampFormat: time.RFC3339Nano,
-			FieldMap:        fieldMap,
-		}
+	l.jsonOutput = enabled
+	l.applyFormatter()
+}
+
+// SetTimestampFormat sets the format used for log timestamps. An empty format
+// resets it to the default (RFC3339 with nanoseconds).
+func (l *daprLogger) SetTimestampFormat(format string) {
+	if format == "" {
+		format = defaultTimestampFormat
 	}
 
-	l.logger.Logger.SetFormatter(formatter)
+	l.timestampFormat = format
+	l.applyFormatter()
 }
 
 // SetAppID sets app_id field in the log. Default value is empty string.
@@ -173,4 +167,32 @@ func (l *daprLogger) Fatal(args ...any) {
 // Fatalf logs a message at level Fatal then the process will exit with status set to 1.
 func (l *daprLogger) Fatalf(format string, args ...any) {
 	l.logger.Fatalf(format, args...)
+}
+
+// applyFormatter builds and applies the logrus formatter based on the current
+// output format and timestamp format.
+func (l *daprLogger) applyFormatter() {
+	var formatter logrus.Formatter
+
+	fieldMap := logrus.FieldMap{
+		// If time field name is conflicted, logrus adds "fields." prefix.
+		// So rename to unused field @time to avoid the confliction.
+		logrus.FieldKeyTime:  logFieldTimeStamp,
+		logrus.FieldKeyLevel: logFieldLevel,
+		logrus.FieldKeyMsg:   logFieldMessage,
+	}
+
+	if l.jsonOutput {
+		formatter = &logrus.JSONFormatter{ //nolint: exhaustruct
+			TimestampFormat: l.timestampFormat,
+			FieldMap:        fieldMap,
+		}
+	} else {
+		formatter = &logrus.TextFormatter{ //nolint: exhaustruct
+			TimestampFormat: l.timestampFormat,
+			FieldMap:        fieldMap,
+		}
+	}
+
+	l.logger.Logger.SetFormatter(formatter)
 }
