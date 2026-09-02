@@ -32,7 +32,6 @@ func TestOptions(t *testing.T) {
 		assert.Equal(t, undefinedAppID, o.appID)
 		assert.Equal(t, defaultOutputLevel, o.OutputLevel)
 		assert.Empty(t, o.OutputFile)
-		assert.Equal(t, defaultOutputFileTee, o.OutputFileTee)
 	})
 
 	t.Run("set dapr ID", func(t *testing.T) {
@@ -107,12 +106,12 @@ func TestOptions(t *testing.T) {
 			"log-file-max-size":    "",
 			"log-file-max-backups": "",
 			"log-file-max-age":     "",
+			"log-file-compression": "",
 		}, stringFlags)
 
 		assert.Equal(t, map[string]bool{
-			"log-as-json":       defaultJSONOutput,
-			"log-file-tee":      defaultOutputFileTee,
-			"log-file-compress": defaultOutputFileCompress,
+			"log-as-json":  defaultJSONOutput,
+			"log-file-tee": false,
 		}, boolFlags)
 	})
 }
@@ -208,7 +207,7 @@ func TestLogFileTee(t *testing.T) {
 
 	o := DefaultOptions()
 	o.OutputFile = logPath
-	o.OutputFileTee = true
+	o.outputFileTee = true
 
 	l := NewLogger("testLoggerTee")
 
@@ -239,7 +238,7 @@ func TestLogFileTeeDisabledKeepsFileOnly(t *testing.T) {
 
 	o := DefaultOptions()
 	o.OutputFile = logPath
-	// OutputFileTee deliberately left false — this is the pre-existing
+	// outputFileTee deliberately left false — this is the pre-existing
 	// behaviour and must not change.
 
 	l := NewLogger("testLoggerTeeDisabled")
@@ -259,10 +258,13 @@ func TestNewFileWriter(t *testing.T) {
 	t.Run("rotation options build a rotating writer", func(t *testing.T) {
 		o := DefaultOptions()
 		o.OutputFile = filepath.Join(t.TempDir(), "dapr.log")
-		o.OutputFileMaxSize = "1"
-		o.OutputFileMaxBackups = "3"
-		o.OutputFileMaxAge = "7"
-		o.OutputFileCompress = true
+		o.outputFileMaxSize = new(uint)
+		*o.outputFileMaxSize = 1
+		o.outputFileMaxBackups = new(uint)
+		*o.outputFileMaxBackups = 3
+		o.outputFileMaxAge = new(uint)
+		*o.outputFileMaxAge = 7
+		o.outputFileCompression = compressionGzip
 
 		w, c, err := newFileWriter(&o)
 		require.NoError(t, err)
@@ -294,7 +296,7 @@ func TestNewFileWriter(t *testing.T) {
 	t.Run("compress alone is enough to enable rotation", func(t *testing.T) {
 		o := DefaultOptions()
 		o.OutputFile = filepath.Join(t.TempDir(), "dapr.log")
-		o.OutputFileCompress = true
+		o.outputFileCompression = compressionGzip
 
 		w, c, err := newFileWriter(&o)
 		require.NoError(t, err)
@@ -305,43 +307,58 @@ func TestNewFileWriter(t *testing.T) {
 		require.NoError(t, c.Close())
 	})
 
-	t.Run("invalid rotation value errors", func(t *testing.T) {
+	t.Run("invalid flag values fail validation", func(t *testing.T) {
 		for _, tc := range []struct {
 			name  string
 			apply func(o *Options)
 		}{
-			{"max-size not a number", func(o *Options) { o.OutputFileMaxSize = "not-a-number" }},
-			{"max-backups negative", func(o *Options) { o.OutputFileMaxBackups = "-1" }},
-			{"max-age not a number", func(o *Options) { o.OutputFileMaxAge = "7d" }},
+			{"max-size not a number", func(o *Options) { o.outputFileMaxSizeStr = "not-a-number" }},
+			{"max-backups negative", func(o *Options) { o.outputFileMaxBackupsStr = "-1" }},
+			{"max-age not a number", func(o *Options) { o.outputFileMaxAgeStr = "7d" }},
+			{"unknown compression", func(o *Options) { o.outputFileCompressionStr = "zstd" }},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				o := DefaultOptions()
 				o.OutputFile = filepath.Join(t.TempDir(), "dapr.log")
 				tc.apply(&o)
 
-				_, _, err := newFileWriter(&o)
-				require.Error(t, err)
+				require.Error(t, o.validate())
 			})
+		}
+	})
+
+	t.Run("compression values parse", func(t *testing.T) {
+		for str, want := range map[string]logFileCompression{
+			"":     compressionNone,
+			"none": compressionNone,
+			"gzip": compressionGzip,
+		} {
+			o := DefaultOptions()
+			o.outputFileCompressionStr = str
+
+			require.NoError(t, o.validate())
+			assert.Equal(t, want, o.outputFileCompression)
 		}
 	})
 }
 
-func TestParseRotationValue(t *testing.T) {
-	t.Run("empty means disabled", func(t *testing.T) {
-		got, err := parseRotationValue("log-file-max-size", "")
+func TestParseOptionalUint(t *testing.T) {
+	t.Run("empty means not provided", func(t *testing.T) {
+		got, err := parseOptionalUint("log-file-max-size", "")
 		require.NoError(t, err)
-		assert.Equal(t, 0, got)
+		assert.Nil(t, got)
 	})
 
 	t.Run("parses a non-negative integer", func(t *testing.T) {
-		got, err := parseRotationValue("log-file-max-size", "42")
+		got, err := parseOptionalUint("log-file-max-size", "42")
 		require.NoError(t, err)
-		assert.Equal(t, 42, got)
+		require.NotNil(t, got)
+		assert.Equal(t, uint(42), *got)
 	})
 
 	t.Run("rejects negatives and non-numbers", func(t *testing.T) {
 		for _, v := range []string{"-1", "abc", "1.5", " 1"} {
-			_, err := parseRotationValue("log-file-max-size", v)
+			_, err := parseOptionalUint("log-file-max-size", v)
 			require.Error(t, err, "value %q should be rejected", v)
 		}
 	})
@@ -352,7 +369,7 @@ func TestApplyOptionsToLoggersRotation(t *testing.T) {
 
 	o := DefaultOptions()
 	o.OutputFile = logPath
-	o.OutputFileMaxSize = "1"
+	o.outputFileMaxSizeStr = "1"
 
 	l := NewLogger("testLoggerRotation")
 
@@ -389,7 +406,7 @@ func TestInertFileOptionsWarn(t *testing.T) {
 
 	// Tee (or any rotation option) without --log-file warns on the console.
 	o := DefaultOptions()
-	o.OutputFileTee = true
+	o.outputFileTee = true
 	require.NoError(t, ApplyOptionsToLoggers(&o))
 	assert.Contains(t, console.String(), warning)
 
@@ -405,7 +422,7 @@ func TestInertFileOptionsWarn(t *testing.T) {
 
 	o = DefaultOptions()
 	o.OutputFile = logPath
-	o.OutputFileTee = true
+	o.outputFileTee = true
 	require.NoError(t, ApplyOptionsToLoggers(&o))
 	assert.NotContains(t, console.String(), warning)
 }
@@ -426,7 +443,8 @@ func TestRotationKeepsFilePermissionParity(t *testing.T) {
 	rotPath := filepath.Join(dir, "rotating.log")
 	o = DefaultOptions()
 	o.OutputFile = rotPath
-	o.OutputFileMaxSize = "1"
+	o.outputFileMaxSize = new(uint)
+	*o.outputFileMaxSize = 1
 
 	w, c, err = newFileWriter(&o)
 	require.NoError(t, err)
@@ -462,7 +480,7 @@ func TestFileRotationActuallyRotates(t *testing.T) {
 
 	o := DefaultOptions()
 	o.OutputFile = logPath
-	o.OutputFileMaxSize = "1" // 1 MB
+	o.outputFileMaxSizeStr = "1" // 1 MB
 
 	l := NewLogger("testLoggerRotationBehaviour")
 
@@ -528,9 +546,9 @@ func TestTeeWithRotation(t *testing.T) {
 
 	o := DefaultOptions()
 	o.OutputFile = logPath
-	o.OutputFileTee = true
-	o.OutputFileMaxSize = "1"
-	o.OutputFileCompress = true
+	o.outputFileTee = true
+	o.outputFileMaxSizeStr = "1"
+	o.outputFileCompressionStr = "gzip"
 
 	l := NewLogger("testLoggerTeeRotation")
 
