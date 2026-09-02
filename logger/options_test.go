@@ -103,6 +103,7 @@ func TestOptions(t *testing.T) {
 		assert.Equal(t, map[string]string{
 			"log-level":            defaultOutputLevel,
 			"log-file":             "",
+			"log-timestamp-format": "",
 			"log-file-max-size":    "",
 			"log-file-max-backups": "",
 			"log-file-max-age":     "",
