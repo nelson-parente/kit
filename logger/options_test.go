@@ -644,6 +644,40 @@ func TestLogOutputsStderr(t *testing.T) {
 	assert.Contains(t, stderrBuf.String(), msg)
 }
 
+// TestApplyOptionsDestinationOpenFailure pins the error-unwind path: when a
+// destination fails to open mid-list, the apply must fail without redirecting
+// any logger away from its previous output.
+func TestApplyOptionsDestinationOpenFailure(t *testing.T) {
+	// A directory cannot be opened O_WRONLY, so it fails as a file destination.
+	dir := t.TempDir()
+
+	var console bytes.Buffer
+
+	consoleWriter = &console
+
+	t.Cleanup(func() {
+		consoleWriter = os.Stdout
+		o := DefaultOptions()
+		require.NoError(t, ApplyOptionsToLoggers(&o))
+	})
+
+	l := NewLogger("testLoggerOpenFailure")
+
+	// Point loggers at the captured console first, so "unchanged" is
+	// observable after the failed apply.
+	o := DefaultOptions()
+	require.NoError(t, ApplyOptionsToLoggers(&o))
+
+	bad := DefaultOptions()
+	bad.outputsStr = "stdout," + dir
+	require.Error(t, ApplyOptionsToLoggers(&bad))
+
+	msg := "still-on-previous-output"
+	l.Info(msg)
+	assert.Contains(t, console.String(), msg,
+		"loggers must keep their previous output when a destination fails to open")
+}
+
 func TestValidateDestinations(t *testing.T) {
 	t.Run("consoles sort before files, entries trimmed and deduplicated", func(t *testing.T) {
 		o := DefaultOptions()
@@ -652,6 +686,15 @@ func TestValidateDestinations(t *testing.T) {
 
 		require.NoError(t, o.validate())
 		assert.Equal(t, []string{"stdout", "stderr", "/var/log/a.log"}, o.outputDestinations)
+	})
+
+	t.Run("path spellings normalize to one destination", func(t *testing.T) {
+		o := DefaultOptions()
+		o.OutputFile = "a.log"
+		o.outputsStr = "./a.log"
+
+		require.NoError(t, o.validate())
+		assert.Equal(t, []string{"a.log"}, o.outputDestinations)
 	})
 
 	t.Run("empty configuration means no destinations", func(t *testing.T) {

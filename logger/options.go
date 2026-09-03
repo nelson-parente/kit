@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -146,17 +147,17 @@ func (o *Options) AttachCmdFlags(
 			&o.outputFileMaxSizeStr,
 			"log-file-max-size",
 			"",
-			"Maximum size in megabytes of the log file before it gets rotated. 0 disables size-based rotation. No effect without --log-file")
+			"Maximum size in megabytes of the log file before it gets rotated. 0 disables size-based rotation. No effect without a file destination")
 		stringVar(
 			&o.outputFileMaxBackupsStr,
 			"log-file-max-backups",
 			"",
-			"Maximum number of rotated log files to keep. 0 keeps all files. No effect without --log-file")
+			"Maximum number of rotated log files to keep. 0 keeps all files. No effect without a file destination")
 		stringVar(
 			&o.outputFileMaxAgeStr,
 			"log-file-max-age",
 			"",
-			"Maximum number of days to retain rotated log files. 0 disables age-based deletion. No effect without --log-file")
+			"Maximum number of days to retain rotated log files. 0 disables age-based deletion. No effect without a file destination")
 		stringVar(
 			&o.outputFileCompressionStr,
 			"log-file-compression",
@@ -204,6 +205,14 @@ func (o *Options) validate() error {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			return
+		}
+
+		if !isConsoleDestination(entry) {
+			// Normalize file paths so the same file spelled differently
+			// (./x.log vs x.log) deduplicates to a single writer — two
+			// writers on one file would double every line and corrupt
+			// rotation.
+			entry = filepath.Clean(entry)
 		}
 
 		if _, ok := seen[entry]; ok {
