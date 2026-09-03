@@ -107,11 +107,11 @@ func TestOptions(t *testing.T) {
 			"log-file-max-backups": "",
 			"log-file-max-age":     "",
 			"log-file-compression": "",
+			"log-outputs":          "",
 		}, stringFlags)
 
 		assert.Equal(t, map[string]bool{
-			"log-as-json":  defaultJSONOutput,
-			"log-file-tee": false,
+			"log-as-json": defaultJSONOutput,
 		}, boolFlags)
 	})
 }
@@ -206,8 +206,7 @@ func TestLogFileTee(t *testing.T) {
 	})
 
 	o := DefaultOptions()
-	o.OutputFile = logPath
-	o.outputFileTee = true
+	o.outputsStr = "stdout," + logPath
 
 	l := NewLogger("testLoggerTee")
 
@@ -237,9 +236,9 @@ func TestLogFileTeeDisabledKeepsFileOnly(t *testing.T) {
 	})
 
 	o := DefaultOptions()
-	o.OutputFile = logPath
-	// outputFileTee deliberately left false — this is the pre-existing
-	// behaviour and must not change.
+	o.outputsStr = logPath
+	// No console entry in --log-outputs: the file is the complete
+	// destination list, so the console must stay silent.
 
 	l := NewLogger("testLoggerTeeDisabled")
 
@@ -266,7 +265,7 @@ func TestNewFileWriter(t *testing.T) {
 		*o.outputFileMaxAge = 7
 		o.outputFileCompression = compressionGzip
 
-		w, c, err := newFileWriter(&o)
+		w, c, err := newFileWriter(o.OutputFile, &o)
 		require.NoError(t, err)
 
 		lj, ok := w.(*lumberjack.Logger)
@@ -284,7 +283,7 @@ func TestNewFileWriter(t *testing.T) {
 		o := DefaultOptions()
 		o.OutputFile = filepath.Join(t.TempDir(), "dapr.log")
 
-		w, c, err := newFileWriter(&o)
+		w, c, err := newFileWriter(o.OutputFile, &o)
 		require.NoError(t, err)
 
 		_, ok := w.(*os.File)
@@ -298,7 +297,7 @@ func TestNewFileWriter(t *testing.T) {
 		o.OutputFile = filepath.Join(t.TempDir(), "dapr.log")
 		o.outputFileCompression = compressionGzip
 
-		w, c, err := newFileWriter(&o)
+		w, c, err := newFileWriter(o.OutputFile, &o)
 		require.NoError(t, err)
 
 		_, ok := w.(*lumberjack.Logger)
@@ -402,11 +401,11 @@ func TestInertFileOptionsWarn(t *testing.T) {
 		require.NoError(t, ApplyOptionsToLoggers(&o))
 	})
 
-	const warning = "have no effect because --log-file is not set"
+	const warning = "have no effect because no file destination is configured"
 
-	// Tee (or any rotation option) without --log-file warns on the console.
+	// A rotation option without any file destination warns on the console.
 	o := DefaultOptions()
-	o.outputFileTee = true
+	o.outputFileMaxSizeStr = "1"
 	require.NoError(t, ApplyOptionsToLoggers(&o))
 	assert.Contains(t, console.String(), warning)
 
@@ -417,12 +416,12 @@ func TestInertFileOptionsWarn(t *testing.T) {
 	require.NoError(t, ApplyOptionsToLoggers(&o))
 	assert.NotContains(t, console.String(), warning)
 
-	// The same options with --log-file set are effective, so no warning.
+	// The same options with a file destination are effective, so no warning.
 	console.Reset()
 
 	o = DefaultOptions()
 	o.OutputFile = logPath
-	o.outputFileTee = true
+	o.outputFileMaxSizeStr = "1"
 	require.NoError(t, ApplyOptionsToLoggers(&o))
 	assert.NotContains(t, console.String(), warning)
 }
@@ -434,7 +433,7 @@ func TestRotationKeepsFilePermissionParity(t *testing.T) {
 	o := DefaultOptions()
 	o.OutputFile = plainPath
 
-	w, c, err := newFileWriter(&o)
+	w, c, err := newFileWriter(o.OutputFile, &o)
 	require.NoError(t, err)
 	_, err = w.Write([]byte("x\n"))
 	require.NoError(t, err)
@@ -446,7 +445,7 @@ func TestRotationKeepsFilePermissionParity(t *testing.T) {
 	o.outputFileMaxSize = new(uint)
 	*o.outputFileMaxSize = 1
 
-	w, c, err = newFileWriter(&o)
+	w, c, err = newFileWriter(o.OutputFile, &o)
 	require.NoError(t, err)
 	_, err = w.Write([]byte("x\n"))
 	require.NoError(t, err)
@@ -545,8 +544,7 @@ func TestTeeWithRotation(t *testing.T) {
 	})
 
 	o := DefaultOptions()
-	o.OutputFile = logPath
-	o.outputFileTee = true
+	o.outputsStr = "stdout," + logPath
 	o.outputFileMaxSizeStr = "1"
 	o.outputFileCompressionStr = "gzip"
 
@@ -561,6 +559,107 @@ func TestTeeWithRotation(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(b), msg, "rotating writer should still receive the message")
 	assert.Contains(t, console.String(), msg, "console should still receive the message when rotation is on")
+}
+
+// TestLogOutputsUnionWithLogFile covers both flags together: --log-file merges
+// into the destination list rather than being overridden or duplicated.
+func TestLogOutputsUnionWithLogFile(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "dapr.log")
+
+	var console bytes.Buffer
+
+	consoleWriter = &console
+
+	t.Cleanup(func() {
+		consoleWriter = os.Stdout
+		o := DefaultOptions()
+		require.NoError(t, ApplyOptionsToLoggers(&o))
+	})
+
+	o := DefaultOptions()
+	o.OutputFile = logPath
+	o.outputsStr = "stdout"
+
+	l := NewLogger("testLoggerUnion")
+
+	require.NoError(t, ApplyOptionsToLoggers(&o))
+
+	msg := "union-msg"
+	l.Info(msg)
+
+	b, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), msg, "the --log-file destination should receive the message")
+	assert.Contains(t, console.String(), msg, "the stdout destination should receive the message")
+}
+
+// TestLogOutputsDeduplicates proves a destination listed twice writes once —
+// two writers on one file would double every line, and two lumberjack
+// instances on one path would corrupt rotation.
+func TestLogOutputsDeduplicates(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "dapr.log")
+
+	o := DefaultOptions()
+	o.OutputFile = logPath
+	o.outputsStr = logPath + "," + logPath
+
+	l := NewLogger("testLoggerDedupe")
+
+	require.NoError(t, ApplyOptionsToLoggers(&o))
+
+	t.Cleanup(func() {
+		d := DefaultOptions()
+		require.NoError(t, ApplyOptionsToLoggers(&d))
+	})
+
+	msg := "dedupe-msg"
+	l.Info(msg)
+
+	b, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	assert.Equal(t, 1, strings.Count(string(b), msg), "a deduplicated destination must receive the message exactly once")
+}
+
+func TestLogOutputsStderr(t *testing.T) {
+	var stderrBuf bytes.Buffer
+
+	stderrWriter = &stderrBuf
+
+	t.Cleanup(func() {
+		stderrWriter = os.Stderr
+		o := DefaultOptions()
+		require.NoError(t, ApplyOptionsToLoggers(&o))
+	})
+
+	o := DefaultOptions()
+	o.outputsStr = "stderr"
+
+	l := NewLogger("testLoggerStderr")
+
+	require.NoError(t, ApplyOptionsToLoggers(&o))
+
+	msg := "stderr-msg"
+	l.Info(msg)
+
+	assert.Contains(t, stderrBuf.String(), msg)
+}
+
+func TestValidateDestinations(t *testing.T) {
+	t.Run("consoles sort before files, entries trimmed and deduplicated", func(t *testing.T) {
+		o := DefaultOptions()
+		o.OutputFile = "/var/log/a.log"
+		o.outputsStr = " /var/log/a.log , stdout,, stderr "
+
+		require.NoError(t, o.validate())
+		assert.Equal(t, []string{"stdout", "stderr", "/var/log/a.log"}, o.outputDestinations)
+	})
+
+	t.Run("empty configuration means no destinations", func(t *testing.T) {
+		o := DefaultOptions()
+
+		require.NoError(t, o.validate())
+		assert.Empty(t, o.outputDestinations)
+	})
 }
 
 func TestApplyOptionsToLoggersFileOutputReapply(t *testing.T) {

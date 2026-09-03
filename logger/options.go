@@ -14,10 +14,13 @@ limitations under the License.
 package logger
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,10 +47,17 @@ var (
 	logOutputMu     sync.Mutex
 	logOutputCloser io.Closer
 
-	// consoleWriter is the console log destination. It is a variable rather
-	// than a direct os.Stdout reference so that tests can capture console
-	// output.
+	// consoleWriter and stderrWriter are the console log destinations. They
+	// are variables rather than direct os.Stdout/os.Stderr references so that
+	// tests can capture console output.
 	consoleWriter io.Writer = os.Stdout
+	stderrWriter  io.Writer = os.Stderr
+)
+
+// Console destination names accepted in --log-outputs.
+const (
+	destStdout = "stdout"
+	destStderr = "stderr"
 )
 
 // Options defines the sets of options for Dapr logging.
@@ -69,10 +79,12 @@ type Options struct {
 	// nanoseconds).
 	TimestampFormat string
 
-	// outputFileTee, when true and OutputFile is set, writes logs to both the
-	// file and the console instead of the file only. It has no effect when
-	// OutputFile is unset.
-	outputFileTee bool
+	// outputDestinations is the resolved, deduplicated list of log
+	// destinations, parsed by validate() from the --log-outputs receiver
+	// below merged with OutputFile. Console destinations sort before files so
+	// that io.MultiWriter keeps console output alive when file writes start
+	// failing (e.g. disk full). Empty means the console default.
+	outputDestinations []string
 
 	// Typed rotation settings, parsed from the flag receivers below by
 	// validate(). nil means the flag was not provided; an explicit 0 disables
@@ -86,6 +98,7 @@ type Options struct {
 	// so flags whose real type does not line up with those binders are
 	// attached to string receivers and parsed into the typed fields above in
 	// validate() — the same pattern as dapr/dapr cmd/daprd/options.
+	outputsStr               string
 	outputFileMaxSizeStr     string
 	outputFileMaxBackupsStr  string
 	outputFileMaxAgeStr      string
@@ -148,7 +161,12 @@ func (o *Options) AttachCmdFlags(
 			&o.outputFileCompressionStr,
 			"log-file-compression",
 			"",
-			`Compression for rotated log files: "none" or "gzip" (default none). No effect without --log-file`)
+			`Compression for rotated log files: "none" or "gzip" (default none). No effect without a file destination`)
+		stringVar(
+			&o.outputsStr,
+			"log-outputs",
+			"",
+			`Comma-separated list of log destinations: "stdout", "stderr", or a file path (default stdout). Merged with --log-file when both are set`)
 	}
 
 	if boolVar != nil {
@@ -157,11 +175,6 @@ func (o *Options) AttachCmdFlags(
 			"log-as-json",
 			defaultJSONOutput,
 			"print log as JSON (default false)")
-		boolVar(
-			&o.outputFileTee,
-			"log-file-tee",
-			false,
-			"When --log-file is set, also keep writing logs to the console. No effect without --log-file (default false)")
 	}
 }
 
@@ -183,6 +196,40 @@ func (o *Options) validate() error {
 	if err != nil {
 		return err
 	}
+
+	seen := make(map[string]struct{})
+	o.outputDestinations = nil
+
+	addDest := func(entry string) {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			return
+		}
+
+		if _, ok := seen[entry]; ok {
+			return
+		}
+
+		seen[entry] = struct{}{}
+		o.outputDestinations = append(o.outputDestinations, entry)
+	}
+
+	if o.outputsStr != "" {
+		for entry := range strings.SplitSeq(o.outputsStr, ",") {
+			addDest(entry)
+		}
+	}
+
+	if o.OutputFile != "" {
+		addDest(o.OutputFile)
+	}
+
+	// Console destinations first: io.MultiWriter stops at the first failed
+	// writer, so this ordering keeps console output alive even when file
+	// writes start failing (e.g. disk full).
+	sort.SliceStable(o.outputDestinations, func(i, j int) bool {
+		return isConsoleDestination(o.outputDestinations[i]) && !isConsoleDestination(o.outputDestinations[j])
+	})
 
 	switch o.outputFileCompressionStr {
 	case "", string(compressionNone):
@@ -255,24 +302,23 @@ func ApplyOptionsToLoggers(options *Options) error {
 		return err
 	}
 
-	if options.OutputFile == "" && (options.outputFileTee ||
-		options.outputFileCompression == compressionGzip ||
+	if !options.hasFileDestination() && (options.outputFileCompression == compressionGzip ||
 		options.outputFileMaxSize != nil ||
 		options.outputFileMaxBackups != nil ||
 		options.outputFileMaxAge != nil) {
-		// Warn rather than fail: these options are inert without OutputFile,
-		// and an error here would turn a harmless misconfiguration into a
-		// startup failure for every binary that attaches these flags.
-		optionsLogger.Warn("--log-file-tee, --log-file-max-size, --log-file-max-backups, --log-file-max-age and --log-file-compression have no effect because --log-file is not set")
+		// Warn rather than fail: these options are inert without a file
+		// destination, and an error here would turn a harmless
+		// misconfiguration into a startup failure for every binary that
+		// attaches these flags.
+		optionsLogger.Warn("--log-file-max-size, --log-file-max-backups, --log-file-max-age and --log-file-compression have no effect because no file destination is configured (--log-file or --log-outputs)")
 	}
 
 	return nil
 }
 
-// setLogOutput configures log output destination. If options.OutputFile is
-// non-empty, logs are written to the file at that path, and additionally to the
-// console when tee is enabled. If empty, output reverts to the
-// console. The new file is opened before closing the previous one so that
+// setLogOutput points every logger at the configured destinations: the
+// console by default, or the resolved --log-outputs / --log-file destination
+// list. New files are opened before the previous ones are closed so that
 // loggers are never left pointing at a closed file descriptor.
 func setLogOutput(options *Options, loggers map[string]Logger) error {
 	logOutputMu.Lock()
@@ -283,20 +329,39 @@ func setLogOutput(options *Options, loggers map[string]Logger) error {
 		newCloser io.Closer
 	)
 
-	if options.OutputFile != "" {
-		fileOut, closer, err := newFileWriter(options)
-		if err != nil {
-			return err
+	if len(options.outputDestinations) > 0 {
+		writers := make([]io.Writer, 0, len(options.outputDestinations))
+
+		var closers multiCloser
+
+		for _, dest := range options.outputDestinations {
+			switch dest {
+			case destStdout:
+				writers = append(writers, consoleWriter)
+			case destStderr:
+				writers = append(writers, stderrWriter)
+			default:
+				fileOut, closer, err := newFileWriter(dest, options)
+				if err != nil {
+					// Release any files already opened for this apply.
+					closers.Close()
+
+					return err
+				}
+
+				writers = append(writers, fileOut)
+				closers = append(closers, closer)
+			}
 		}
 
-		newCloser = closer
-		out = fileOut
+		if len(writers) == 1 {
+			out = writers[0]
+		} else {
+			out = io.MultiWriter(writers...)
+		}
 
-		if options.outputFileTee {
-			// Console first: io.MultiWriter stops at the first failed writer,
-			// so this ordering keeps console output alive even when file
-			// writes start failing (e.g. disk full).
-			out = io.MultiWriter(consoleWriter, fileOut)
+		if len(closers) > 0 {
+			newCloser = closers
 		}
 	}
 
@@ -315,11 +380,11 @@ func setLogOutput(options *Options, loggers map[string]Logger) error {
 	return nil
 }
 
-// newFileWriter returns the file-backed writer for the options: a plain
-// append-mode file when no rotation option is set, or a rotating (lumberjack)
-// writer when any rotation option is enabled. The returned io.Closer releases
-// the underlying file.
-func newFileWriter(options *Options) (io.Writer, io.Closer, error) {
+// newFileWriter returns the file-backed writer for one destination path: a
+// plain append-mode file when no rotation option is set, or a rotating
+// (lumberjack) writer when any rotation option is enabled. The returned
+// io.Closer releases the underlying file.
+func newFileWriter(path string, options *Options) (io.Writer, io.Closer, error) {
 	var maxSize, maxBackups, maxAge uint
 
 	if options.outputFileMaxSize != nil {
@@ -339,9 +404,9 @@ func newFileWriter(options *Options) (io.Writer, io.Closer, error) {
 	// plain append-mode file path stays byte-for-byte the pre-existing
 	// behaviour.
 	if maxSize == 0 && maxBackups == 0 && maxAge == 0 && options.outputFileCompression != compressionGzip {
-		f, ferr := os.OpenFile(options.OutputFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		f, ferr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if ferr != nil {
-			return nil, nil, fmt.Errorf("failed to open log file %q: %w", options.OutputFile, ferr)
+			return nil, nil, fmt.Errorf("failed to open log file %q: %w", path, ferr)
 		}
 
 		return f, f, nil
@@ -352,15 +417,15 @@ func newFileWriter(options *Options) (io.Writer, io.Closer, error) {
 	// existing ones, so without this, enabling rotation would silently change
 	// new log files from 0644 to 0600 — breaking log shippers that tail the
 	// file from another container as a non-owner user.
-	f, ferr := os.OpenFile(options.OutputFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, ferr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if ferr != nil {
-		return nil, nil, fmt.Errorf("failed to open log file %q: %w", options.OutputFile, ferr)
+		return nil, nil, fmt.Errorf("failed to open log file %q: %w", path, ferr)
 	}
 
 	f.Close()
 
 	lj := &lumberjack.Logger{
-		Filename:   options.OutputFile,
+		Filename:   path,
 		MaxSize:    int(maxSize),    // megabytes; lumberjack defaults to 100 when 0
 		MaxBackups: int(maxBackups), // number of rotated files retained
 		MaxAge:     int(maxAge),     // days
@@ -385,4 +450,37 @@ func parseOptionalUint(name, value string) (*uint, error) {
 	u := uint(n)
 
 	return &u, nil
+}
+
+// isConsoleDestination reports whether a --log-outputs entry names a console
+// stream rather than a file path.
+func isConsoleDestination(dest string) bool {
+	return dest == destStdout || dest == destStderr
+}
+
+// hasFileDestination reports whether any configured destination is a file.
+func (o *Options) hasFileDestination() bool {
+	for _, dest := range o.outputDestinations {
+		if !isConsoleDestination(dest) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// multiCloser closes a set of io.Closers, joining any errors.
+type multiCloser []io.Closer
+
+func (m multiCloser) Close() error {
+	var errs []error
+
+	for _, c := range m {
+		err := c.Close()
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.Join(errs...)
 }
