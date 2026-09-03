@@ -685,7 +685,10 @@ func TestValidateDestinations(t *testing.T) {
 		o.outputsStr = " /var/log/a.log , stdout,, stderr "
 
 		require.NoError(t, o.validate())
-		assert.Equal(t, []string{"stdout", "stderr", "/var/log/a.log"}, o.outputDestinations)
+		// File paths pass through filepath.Clean, whose separator differs by
+		// OS — compare against the cleaned form so the assertion is
+		// platform-correct (this is what broke Windows CI).
+		assert.Equal(t, []string{"stdout", "stderr", filepath.Clean("/var/log/a.log")}, o.outputDestinations)
 	})
 
 	t.Run("path spellings normalize to one destination", func(t *testing.T) {
